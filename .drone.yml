@@ -6,59 +6,23 @@ trigger:
   event:
   - push
 steps:
-- name: build
-  image: plugins/ecr
+- name: docker build
+  image: plugins/docker
   privileged: true
   settings:
-    repo: 577012953595.dkr.ecr.us-west-2.amazonaws.com/relay-web-app
-    registry: 577012953595.dkr.ecr.us-west-2.amazonaws.com
-    region: us-west-2
-    tags: commit-${DRONE_COMMIT},dev-build-${DRONE_BUILD_NUMBER}
+    repo: registry.sherpany.com/talk-relay
+    tags: dev
     build_args:
     - source_version=${DRONE_COMMIT}
     - build_target=ci
-  volumes:
-   - name: docker
-     path: /var/run/docker.sock
-- name: deploy-master
-  image: quay.io/honestbee/drone-kubernetes
-  when:
-    branch:
-    - master
-  settings:
-    kubernetes_server: https://172.20.0.1
-    kubernetes_token:
-      from_secret: drone-deploy-token
-    kubernetes_cert:
-      from_secret: drone-deploy-cert
-    deployment: relay-web-app
-    repo: 577012953595.dkr.ecr.us-west-2.amazonaws.com/relay-web-app
-    container: web
-    tag: commit-${DRONE_COMMIT}
-- name: deploy-bleeds
-  image: quay.io/honestbee/drone-kubernetes
-  when:
-    branch:
-    - bleeds
-  settings:
-    kubernetes_server: https://172.20.0.1
-    kubernetes_token:
-      from_secret: drone-deploy-token
-    kubernetes_cert:
-      from_secret: drone-deploy-cert
-    deployment: relay-web-app-bleeds
-    repo: 577012953595.dkr.ecr.us-west-2.amazonaws.com/relay-web-app
-    container: web
-    tag: commit-${DRONE_COMMIT}
+
 - name: notify
-  image: plugins/webhook
+  image: plugins/slack
   settings:
-    urls: http://172.20.207.235/drone
+    webhook:
+      from_secret: slack_webhook
+    channel: drone
   when:
     status:
     - success
     - failure
-volumes:
-- name: docker
-  host:
-    path: /var/run/docker.sock
