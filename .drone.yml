@@ -26,4 +26,3 @@ steps:
     status:
     - success
     - failure
-
