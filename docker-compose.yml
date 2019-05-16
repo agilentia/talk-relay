@@ -1,0 +1,21 @@
+version: '3.5'
+
+services:
+  web:
+    build: .
+    networks:
+      default:
+      proxy:
+        aliases:
+          - web.relay.talk
+    labels:
+     - traefik.enable=true
+     - traefik.frontend.rule=Host:talk.sherpany.me
+     - traefik.backend=talk-relay
+     - traefik.port=1080
+
+networks:
+  # our proxy network spanning multiple projects
+  proxy:
+    name: sherpany-proxy
+  default:
