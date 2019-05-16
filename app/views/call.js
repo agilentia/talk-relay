@@ -1,5 +1,5 @@
 // vim: ts=4:sw=4:expandtab
-/* global relay, platform, chrome, moment */
+/* global platform, chrome, moment */
 
 (function () {
     'use strict';
@@ -55,10 +55,6 @@
         const track = canvas.captureStream().getVideoTracks()[0];
         track.dummy = true;
         return track;
-    }
-
-    function isPeerConnectState(iceState) {
-        return iceState === 'connected' || iceState === 'completed';
     }
 
     function chromeScreenShareExtRPC(msg) {
@@ -140,6 +136,46 @@
         });
     }
 
+    class ForstaRTCPeerConnection extends RTCPeerConnection {
+
+        static makeLabel(id, addr) {
+            return `${addr} (peerId:${id})`;
+        }
+
+        constructor(id, addr, options) {
+            super(options);
+            this._meta = {
+                id,
+                addr
+            };
+            this.label = this.constructor.makeLabel(id, addr);
+        }
+
+        setMeta(key, value) {
+            this._meta[key] = value;
+        }
+
+        getMeta(key) {
+            return this._meta[key];
+        }
+
+        isConnected() {
+            const iceState = this.iceConnectionState;
+            return iceState === 'connected' || iceState === 'completed';
+        }
+
+        isStale() {
+            if (this.isConnected()) {
+                return false;
+            }
+            const lastConnected = this.getMeta('connected');
+            const now = Date.now();
+            return lastConnected ? (now - lastConnected > 30000) :
+                                   (now - this.getMeta('added') > 30000);
+        }
+    }
+
+
     F.CallView = F.View.extend({
 
         template: 'views/call.html',
@@ -192,6 +228,7 @@
         },
 
         setup: async function() {
+            this.$el.toggleClass('debug-stats', !!await F.state.get('callDebugStats'));
             await this.bindOutStream();
             this._soundCheckInterval = setInterval(this.checkSoundLevels.bind(this), 500);
             for (const [event, listener] of Object.entries(this._fullscreenEvents)) {
@@ -653,7 +690,7 @@
         },
 
         makePeerConnection: function(peerId, addr) {
-            const peer = new RTCPeerConnection({iceServers: this.iceServers});
+            const peer = new ForstaRTCPeerConnection(peerId, addr, {iceServers: this.iceServers});
             for (const track of this.outStream.getTracks()) {
                 peer.addTrack(track, this.outStream);
             }
@@ -662,12 +699,14 @@
                 if (!icecandidates.length) {
                     return;  // Only sentinel in buffered args, we're done.
                 }
-                console.debug(`Sending ${icecandidates.length} ICE candidate(s) to: ${addr}`);
-                await this.manager.sendControlToDevice('callICECandidates', addr, {icecandidates, peerId});
+                console.debug(`Sending ${icecandidates.length} ICE candidates to:`, peer.label);
+                await this.manager.sendControlToDevice('callICECandidates', addr,
+                                                       {icecandidates, peerId});
             }, 200, {max: 600});
             peer.addEventListener('icecandidate', onICECandidate);
             peer.addEventListener('icegatheringstatechange', ev => {
-                console.debug(`ICE Gathering State Change for ${addr}: ${peer.iceGatheringState}`);
+                console.debug(`ICE Gathering State Change for: ${peer.label} ` +
+                              `-> ${peer.iceGatheringState}`);
                 if (peer.iceGatheringState === 'complete') {
                     onICECandidate.flush();  // Eliminate negotiation latency.
                 }
@@ -752,10 +791,10 @@
 
         onPeerOffer: async function(ev) {
             F.assert(ev.data.callId === this.manager.callId);
-            F.assert(!this.getMemberView(ev.sender, ev.device));
+            const view = this.getMemberView(ev.sender, ev.device) ||
+                         this.addMemberView(ev.sender, ev.device);
             const addr = `${ev.sender}.${ev.device}`;
             console.info('Peer sent us a call-offer:', addr);
-            const view = this.addMemberView(ev.sender, ev.device);
             await view.acceptOffer(ev.data);
         },
 
@@ -776,23 +815,22 @@
 
         onPeerICECandidates: async function(ev) {
             F.assert(ev.data.callId === this.manager.callId);
-            F.assert(ev.data.peerId);
+            const peerId = ev.data.peerId;
+            F.assert(peerId);
             const addr = `${ev.sender}.${ev.device}`;
+            const label = ForstaRTCPeerConnection.makeLabel(peerId, addr);
             if (!this.isJoined()) {
-                console.warn("Queuing ICE candidates while not joined:", addr);
-                this.enqueueEarlyICECandidates(ev.data.peerId, ev.data.icecandidates);  // paranoid
+                console.warn(`Queuing ICE candidates while not joined:`, label);
+                this.enqueueEarlyICECandidates(peerId, ev.data.icecandidates);  // paranoid
                 return;
             }
             const view = this.getMemberView(ev.sender, ev.device);
-            const peer = view && view.getPeer(ev.data.peerId);
-            if (!peer) {
-                console.warn("Queuing ICE candidates for unknown peer connection from:", addr);
-                this.enqueueEarlyICECandidates(ev.data.peerId, ev.data.icecandidates);
-            } else if (!peer.remoteDescription) {
-                console.warn("Queuing ICE candidates for initiating peer connection from:", addr);
-                this.enqueueEarlyICECandidates(ev.data.peerId, ev.data.icecandidates);
+            const peer = view && view.getPeer(peerId);
+            if (!peer || !peer.remoteDescription) {
+                console.warn(`Queuing ICE candidates for:`, label);
+                this.enqueueEarlyICECandidates(peerId, ev.data.icecandidates);
             } else {
-                console.debug(`Adding ${ev.data.icecandidates.length} ICE candidate(s) for:`, addr);
+                console.debug(`Adding ${ev.data.icecandidates.length} ICE candidates for:`, label);
                 await Promise.all(ev.data.icecandidates.map(x =>
                     peer.addIceCandidate(new RTCIceCandidate(x))));
             }
@@ -1194,12 +1232,80 @@
             this.callView = options.callView;
             this.soundRMS = -1;
             this._peers = new Map();
+            this.streamChanged = Date.now();
             this.outgoing = this.userId === F.currentUser.id && this.device === F.currentDevice;
             if (this.outgoing) {
                 this.$el.addClass('outgoing');
+            } else {
+                this._peerCheckInterval = setInterval(this.peerCheck.bind(this), 1000);
             }
             this.$el.css('order', options.order);
             F.View.prototype.initialize(options);
+        },
+
+        peerCheck: async function() {
+            const peers = this.getPeers();
+            for (const peer of peers) {
+                for (const sender of peer.getReceivers()) {
+                    const stats = await peer.getStats(sender.track);
+                    this.trigger("peerstats", sender.track, stats);
+                }
+            }
+            if (this._peerActionTimeout) {
+                return;
+            }
+            if (peers.length === 0) {
+                this._schedPeerActionSoon(() => {
+                    if (this.getPeers().length === 0) {
+                        if (Date.now() - this.streamChanged > 60000) {
+                            console.warn("Dropping unavailable member:", this.addr);
+                            this.callView.removeMemberView(this);
+                        } else {
+                            console.warn("Creating new peer connection offer for:", this.addr);
+                            this.sendOffer();
+                        }
+                    }
+                });
+            } else {
+                for (const peer of peers.filter(x => x.isStale())) {
+                    this._schedPeerActionSoon(() => {
+                        if (!peer.isConnected()) {
+                            console.warn(`Removing stale connection:`, peer.label);
+                            this.removePeer(peer);
+                        }
+                    });
+                }
+                const connected = peers.filter(x => x.isConnected());
+                if (connected.length && !this.streamingPeer) {
+                    const newest = connected[connected.length - 1];
+                    console.warn(`Binding media stream to newest connection:`, newest.label);
+                    debugger;
+                    this.bindStream(newest.getMeta('stream'));
+                }
+                if (connected.length > 1) {
+                    for (const peer of connected) {
+                        if (peer !== this.streamingPeer) {
+                            this._schedPeerActionSoon(() => {
+                                if (peer !== this.streamingPeer) {
+                                    console.warn(`Removing redundant connection:`, peer.label);
+                                    this.removePeer(peer);
+                                }
+                            });
+                            break;  // Only one at a time, slow gc avoids interruptions
+                        }
+                    }
+                }
+            }
+        },
+
+        _schedPeerActionSoon: function(callback) {
+            this._peerActionTimeout = setTimeout(async () => {
+                try {
+                    await callback();
+                } finally {
+                    this._peerActionTimeout = null;
+                }
+            }, 1000 + (Math.random() * 3000));
         },
 
         render_attributes: async function() {
@@ -1221,13 +1327,16 @@
             await F.View.prototype.render.call(this);
             this.videoEl = this.$('video')[0];
             this.soundIndicatorEl = this.$('.f-soundlevel .f-indicator')[0];
-            this.bindStream(this.stream, this.streamPeer);
+            this.bindStream(this.stream, this.streamingPeer);
             return this;
         },
 
         remove: function() {
-            for (const x of this.getPeers()) {
-                this.removePeer(x);
+            if (!this.outgoing) {
+                clearInterval(this._peerCheckInterval);
+                for (const x of this.getPeers()) {
+                    this.removePeer(x);
+                }
             }
             return F.View.prototype.remove.call(this);
         },
@@ -1267,7 +1376,6 @@
                 $circle.attr('class', $circle.data('baseClass') + ' ' + addClass);
                 $circle.attr('title', status);
             }
-            this.statusChanged = Date.now();
             this.trigger('statuschanged', this, status);
         },
 
@@ -1295,7 +1403,7 @@
         },
 
         hasConnectedPeer: function() {
-            return this.getPeers().some(x => isPeerConnectState(x.iceConnectionState));
+            return this.getPeers().some(x => x.isConnected());
         },
 
         hasPeers: function() {
@@ -1308,6 +1416,7 @@
 
         addPeer: function(id, peer) {
             this._peers.set(id, peer);
+            peer.setMeta('added', Date.now());
         },
 
         getPeer: function(id) {
@@ -1316,10 +1425,21 @@
 
         removePeer: function(peer) {
             const entries = Array.from(this._peers.entries());
-            const id = entries.find(([key, val]) => val === peer)[0];
-            console.error("id", id);
+            const entry = entries.find(([key, val]) => val === peer);
+            if (!entry) {
+                console.error("Peer already removed:", peer);
+                return;
+            }
+            if (this.streamingPeer === peer) {
+                this.unbindStream();
+            }
             this.unbindPeer(peer);
+            const id = entry[0];
             this._peers.delete(id);
+            for (const x of peer.getReceivers()) {
+                x.track.stop();
+            }
+            peer.close();
         },
 
         sendPeerControl: async function(control, data) {
@@ -1336,10 +1456,13 @@
 
         bindStream: function(stream, peer) {
             F.assert(stream == null || stream instanceof MediaStream);
+            if (stream !== this.stream) {
+                this.streamChanged = Date.now();
+            }
             this.stream = stream;
-            this.streamPeer = peer;
+            this.streamingPeer = peer;
             if (!stream) {
-                this._unbindStream();
+                this.unbindStream();
                 return;
             }
             const silenced = this.isSilenced();
@@ -1386,18 +1509,16 @@
                 const srcObject = hasMedia ? this.stream : null;
                 if (this.videoEl.srcObject !== srcObject) {
                     this.videoEl.srcObject = srcObject;
-                } else {
-                    console.warn("SKIP SRCOBJECT ASSING");
                 }
             }
             this.trigger('bindstream', this, this.stream);
-            const streaming = this.outgoing ? hasMedia : (hasMedia && this.hasConnectedPeer());
+            const streaming = this.outgoing ? hasMedia : (hasMedia && (!peer || peer.isConnected()));
             this.setStreaming(streaming);
         },
 
-        _unbindStream: function(options) {
+        unbindStream: function(options) {
             options = options || {};
-            this.streamPeer = null;
+            this.streamingPeer = null;
             if (this.isStreaming()) {
                 this.setStreaming(false, {silent: options.silent});
             }
@@ -1408,11 +1529,9 @@
                 this.soundDBV = -100;
             }
             if (this.stream) {
-                for (const track of this.stream.getTracks()) {
-                    track.stop();
-                }
+                this.streamChanged = Date.now();
+                this.stream = null;
             }
-            this.stream = null;
             if (this.videoEl) {
                 this.videoEl.srcObject = null;
             }
@@ -1428,14 +1547,19 @@
                     // support becomes available.  Right now chrome doesn't have it, maybe others.
                     // Also don't trust MDN on this, they wrongly claim it is supported since M56.
                     F.assert(this.getPeer(id), 'peer is stale');
-                    const state = ev.target.iceConnectionState;
-                    if (this.streamPeer !== peer) {
-                        console.warn(`Ignoring state change for inactive peer [${id}]: ${state}`, this.addr);
+                    const state = peer.iceConnectionState;
+                    const isConnected = peer.isConnected();
+                    if (isConnected) {
+                        peer.setMeta('connected', Date.now());
+                    }
+                    if (this.streamingPeer !== peer) {
+                        console.warn(`Ignoring ICE state change for inactive connection: ` +
+                                     `${peer.label} -> ${state}`);
                         return;
                     }
-                    console.debug(`Peer ICE connection [${id}]: ${state}`, this.addr);
+                    console.debug(`Peer ICE connection: ${peer.label} -> ${state}`);
                     const hasMedia = !!(this.stream && this.stream.getTracks().length);
-                    const streaming = hasMedia && isPeerConnectState(state);
+                    const streaming = hasMedia && isConnected;
                     if (streaming && !this.isStreaming()) {
                         this.setStreaming(true);
                     } else if (!streaming && this.isStreaming()) {
@@ -1449,8 +1573,9 @@
                     // Firefox will sometimes have more than one media stream but they
                     // appear to always be the same stream. Strange.
                     const stream = ev.streams[0];
+                    peer.setMeta('stream', stream);
                     if (stream !== this.stream) {
-                        console.info("Binding new media stream:", this.addr);
+                        console.info(`Binding new media stream:`, peer.label);
                     }
                     // Be sure to call everytime so we are aware of all tracks.
                     // Using MediaStream.onaddtrack does not work as expected.
@@ -1475,17 +1600,14 @@
         sendOffer: async function() {
             await F.queueAsync(`call-send-offer-${this.addr}`, async () => {
                 this.setStatus();
-                if (this.hasPeers()) {
-                    console.warn('Have existing, possibly stale, peer(s) for:', this.addr);
-                }
+                clearTimeout(this.offeringTimeout);
                 const peerId = F.util.uuid4();
                 const peer = this.callView.makePeerConnection(peerId, this.addr);
                 this.addPeer(peerId, peer);
                 const offer = limitSDPBandwidth(await peer.createOffer(), await F.state.get('callIngressBps'));
                 await peer.setLocalDescription(offer);
                 this.setStatus('Calling');
-                const called = this.statusChanged;
-                console.info("Sending offer to:", this.addr);
+                console.info(`Sending offer to:`, peer.label);
                 await this.sendPeerControl('callOffer', {
                     peerId,
                     offer: {
@@ -1493,19 +1615,12 @@
                         type: peer.localDescription.type
                     }
                 });
-                relay.util.sleep(30).then(() => {
-                    if (this.statusChanged === called) {
-                        this.setStatus('Unavailable');
-                    }
-                });
+                this.offeringTimeout = setTimeout(() => this.setStatus('Unavailable'), 30000);
             });
         },
 
         acceptOffer: async function(data) {
             await F.queueAsync(`call-accept-offer-${this.addr}`, async () => {
-                if (this.hasPeers()) {
-                    console.warn('Have existing, possibly stale, peer(s) for:', this.addr);
-                }
                 const peer = this.callView.makePeerConnection(data.peerId, this.addr);
                 this.addPeer(data.peerId, peer);
                 this.bindPeer(data.peerId, peer);
@@ -1514,7 +1629,8 @@
                 const earlyICECandidates = this.callView.drainEarlyICECandidates(data.peerId);
                 if (earlyICECandidates) {
                     F.assert(earlyICECandidates.length);
-                    console.debug(`Adding ${earlyICECandidates.length} early ICE candidate(s) for:`, this.addr);
+                    console.debug(`Adding ${earlyICECandidates.length} early ICE candidates for:`,
+                                  peer.label);
                     await Promise.all(earlyICECandidates.map(x =>
                         peer.addIceCandidate(new RTCIceCandidate(x))));
                 }
@@ -1533,8 +1649,13 @@
 
         handlePeerAcceptOffer: async function(data) {
             const peer = this.getPeer(data.peerId);
-            F.assert(peer, 'Accept-offer for inactive peer');
-            console.info(`Peer accepted our call offer: ${this.addr}`);
+            if (!peer) {
+                const label = ForstaRTCPeerConnection.makeLabel(data.peerId, this.addr);
+                console.warn(`Peer accepted offer we rescinded:`, label);
+                return;
+            }
+            console.info(`Peer accepted our call offer:`, peer.label);
+            clearTimeout(this.offeringTimeout);
             this.bindPeer(data.peerId, peer);
             await peer.setRemoteDescription(limitSDPBandwidth(data.answer, await F.state.get('callEgressBps')));
             const earlyICECandidates = this.callView.drainEarlyICECandidates(data.peerId);
@@ -1606,6 +1727,7 @@
                     this.stopListening(this.memberView, 'silenced');
                     this.stopListening(this.memberView, 'statuschanged');
                     this.stopListening(this.memberView, 'soundlevel');
+                    this.stopListening(this.memberView, 'peerstats');
                 }
                 this.memberView = view;
                 this.listenTo(view, 'bindstream', this.onMemberBindStream);
@@ -1614,6 +1736,7 @@
                 this.listenTo(view, 'silenced', this.onMemberSilenced);
                 this.listenTo(view, 'statuschanged', this.onMemberStatusChanged);
                 this.listenTo(view, 'soundlevel', this.onMemberSoundLevel);
+                this.listenTo(view, 'peerstats', this.onMemberPeerStats);
             }
             await this.render();
             this.videoEl.srcObject = view.stream;
@@ -1690,6 +1813,58 @@
 
         onMemberSoundLevel: function(levels) {
             this.throttledVolumeIndicate.call(this);
+        },
+
+        onMemberPeerStats: function(track, stats) {
+            const $debugStats = this.$('.f-debug-stats');
+            let $track = $debugStats.find(`.track[data-id="${track.id}"]`);
+            const now = Date.now();
+            if (!$track.length) {
+                $track = $(`
+                    <div class="track" data-id="${track.id}"
+                                       data-created="${now}">
+                        <b>${track.kind}: ${track.id}</b>
+                        <div class="stats"></div>
+                    </div>
+                `);
+                $debugStats.append($track);
+            }
+            $track.data('updated', now);
+            const $stats = $track.find('.stats');
+            const rows = [];
+            for (const stat of stats.values()) {
+                if (stat.type === 'codec') {
+                    rows.push(`<b>Codec:</b> ${stat.mimeType.split('/')[1]}`);
+                } else if (stat.type === 'inbound-rtp') {
+                    rows.push(`<b>Media type:</b> ${stat.mediaType}`);
+                    rows.push(`<b>Bytes recv:</b> ${stat.bytesReceived}`);
+                    rows.push(`<b>Packets lost:</b> ${stat.packetsLost}`);
+                    const age = (now - Number($track.data('created'))) / 1000;
+                    if (age) {
+                        const bitrate = F.tpl.help.humanbits((stat.bytesReceived * 8) / age);
+                        rows.push(`<b>Bitrate:</b> ${bitrate}ps`);
+                    }
+                } else if (stat.type === 'track') {
+                    if (stat.kind === 'audio') {
+                        rows.push(`<b>Audio level:</b> ${stat.audioLevel}`);
+                    } else {
+                        const width = stat.frameWidth;
+                        const height = stat.frameHeight;
+                        if (width && height) {
+                            rows.push(`<b>Resolution:</b> ${width}x${height}`);
+                        }
+                        rows.push(`<b>Frames:</b> ${stat.framesDecoded}`);
+                        rows.push(`<b>Frames dropped:</b> ${stat.framesDropped}`);
+                    }
+                }
+            }
+            $stats.html(rows.join('<br/>'));
+            for (const el of $debugStats.find('.track')) {
+                const $el = $(el);
+                if ($el.data('updated') < Date.now() - 3000) {
+                    $el.remove();  // no longer being updated (probably removed).
+                }
+            }
         }
     });
 
@@ -1753,6 +1928,14 @@
             this.$('.f-video-device .ui.dropdown').dropdown('set selected', videoDevice).dropdown({
                 onChange: this.onVideoDeviceChange.bind(this),
             });
+            const debugStats = !!await F.state.get('callDebugStats');
+            const $cb = this.$('.f-debug .ui.checkbox');
+            if (debugStats) {
+                $cb.checkbox('set checked');
+            }
+            $cb.checkbox({
+                onChange: this.onDebugStatsChange.bind(this),
+            });
             return this;
         },
 
@@ -1810,6 +1993,12 @@
             this.setChanged('stream');
         },
 
+        onDebugStatsChange: async function() {
+            const value = this.$('.f-debug .ui.checkbox input')[0].checked;
+            await F.state.put('callDebugStats', value);
+            this.setChanged('debug-stats');
+        },
+
         onHidden: async function() {
             if (this._changed.size) {
                 if (this._changed.has('stream')) {
@@ -1819,6 +2008,10 @@
                 } else if (this._changed.has('constraint')) {
                     await this.callView.applyStreamConstraints();
                     this._changed.delete('constraint');
+                }
+                if (this._changed.has('debug-stats')) {
+                    this._changed.delete('debug-stats');
+                    this.callView.$el.toggleClass('debug-stats', !!await F.state.get('callDebugStats'));
                 }
                 if (this._changed.size && this.callView.isJoined()) {
                     console.warn("Restarting connection to apply changes.");
