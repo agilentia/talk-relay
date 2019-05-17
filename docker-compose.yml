@@ -10,7 +10,8 @@ services:
           - web.relay.talk
     labels:
      - traefik.enable=true
-     - traefik.frontend.rule=Host:talk.sherpany.me
+     - traefik.frontend.rule=Host:board.sherpany.me;PathPrefix:/@
+     - traefik.frontend.priority=2
      - traefik.backend=talk-relay
      - traefik.port=1080
 
